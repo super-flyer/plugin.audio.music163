@@ -17,7 +17,7 @@ except AttributeError:
 
 PY3 = sys.version_info.major >= 3
 if not PY3:
-    reload(sys)
+    reload(sys) # pyright: ignore[reportUndefinedVariable] 兼容 Python 2 代码
     sys.setdefaultencoding('utf-8')
 
 plugin = Plugin()
