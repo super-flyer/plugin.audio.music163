@@ -3,7 +3,9 @@ import json
 import os
 import sys
 import time
+import uuid
 import requests
+from urllib.parse import quote_plus
 from encrypt import encrypted_request
 from xbmcswift2 import xbmc, xbmcaddon, xbmcplugin
 from http.cookiejar import Cookie
@@ -36,7 +38,8 @@ class NetEase(object):
             "Connection": "keep-alive",
             "Content-Type": "application/x-www-form-urlencoded",
             "Host": "music.163.com",
-            "Referer": "http://music.163.com",
+            "Referer": "https://music.163.com",
+            "Origin": "https://music.163.com",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Safari/537.36",
         }
 
@@ -52,13 +55,21 @@ class NetEase(object):
 
         self.enable_proxy = False
         if xbmcplugin.getSetting(int(sys.argv[1]), 'enable_proxy') == 'true':
-            self.enable_proxy = True
-            proxy = xbmcplugin.getSetting(int(sys.argv[1]), 'host').strip(
-            ) + ':' + xbmcplugin.getSetting(int(sys.argv[1]), 'port').strip()
-            self.proxies = {
-                'http': 'http://' + proxy,
-                'https': 'https://' + proxy,
-            }
+            host = xbmcplugin.getSetting(int(sys.argv[1]), 'host').strip()
+            port = xbmcplugin.getSetting(int(sys.argv[1]), 'port').strip()
+            if host:
+                self.enable_proxy = True
+                if host.startswith('http://') or host.startswith('https://'):
+                    proxy_url = host
+                    if port and '://' in host and host.count(':') == 1:
+                        proxy_url = host + ':' + port
+                else:
+                    proxy_url = host + (':' + port if port else '')
+                    proxy_url = 'http://' + proxy_url
+                self.proxies = {
+                    'http': proxy_url,
+                    'https': proxy_url,
+                }
 
     def _raw_request(self, method, endpoint, data=None):
         if method == "GET":
@@ -120,10 +131,15 @@ class NetEase(object):
         try:
             resp = self._raw_request(method, endpoint, params)
             data = resp.json()
+            if resp.status_code != 200:
+                xbmc.log('[music163] request non-200 status: {} path={} response={}'.format(resp.status_code, path, resp.text[:200]), xbmc.LOGWARNING)
         except requests.exceptions.RequestException as e:
-            print(e)
+            xbmc.log('[music163] request exception for {}: {}'.format(path, repr(e)), xbmc.LOGERROR)
         except ValueError as e:
-            print("Path: {}, response: {}".format(path, resp.text[:200]))
+            try:
+                xbmc.log('[music163] request json parse failed for {}: {} response={}'.format(path, repr(e), resp.text[:200]), xbmc.LOGERROR)
+            except Exception:
+                xbmc.log('[music163] request json parse failed for {}: {}'.format(path, repr(e)), xbmc.LOGERROR)
         finally:
             return data
 
@@ -508,16 +524,126 @@ class NetEase(object):
         return self.request("POST", path)
 
     def login_qr_key(self):
+        # Ensure we have fresh cookies (including __csrf) set by the login page
+        try:
+            # perform a plain GET to /login so server sets any required cookies
+            self._raw_request("GET", BASE_URL + '/login')
+        except Exception:
+            # ignore any errors from the GET; the subsequent request will surface errors
+            pass
+        # Ensure sDeviceId exists (some servers use it to build login chain id)
+        sdevice_name = 'sDeviceId'
+        sdevice_value = None
+        for c in self.session.cookies:
+            if c.name == sdevice_name:
+                sdevice_value = c.value
+                break
+        if not sdevice_value:
+            try:
+                sdevice_value = 'YD-' + uuid.uuid4().hex[:24]
+                self.session.cookies.set_cookie(self.make_cookie(sdevice_name, sdevice_value))
+            except Exception:
+                sdevice_value = None
+        x_login_chain = None
+        try:
+            if sdevice_value:
+                x_login_chain = 'v1_{0}_web_login_{1}'.format(quote_plus(sdevice_value), int(time.time() * 1000))
+        except Exception:
+            x_login_chain = None
+        # Debug: log current cookies to help diagnose environment-related rejections
+        try:
+            cookie_dump = {c.name: c.value for c in self.session.cookies}
+            xbmc.log('[music163] login_qr_key current cookies: {}'.format(cookie_dump), xbmc.LOGDEBUG)
+        except Exception:
+            pass
         path = '/weapi/login/qrcode/unikey'
         params = dict(type=1)
-        return self.request("POST", path, params)
+        # Temporarily augment headers to look more like a browser/web client
+        extra_headers = {
+            'x-loginmethod': 'QrCode',
+            'x-os': 'web',
+            'x-login-chain-id': x_login_chain or '',
+            'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'Referer': 'https://music.163.com/',
+            'Origin': 'https://music.163.com',
+            'x-channelsource': 'undefined',
+        }
+        old_header = self.header.copy()
+        try:
+            self.header.update(extra_headers)
+            # use PC-like cookies for QR login endpoints to match what the web client expects
+            return self.request("POST", path, params, custom_cookies={'os': 'pc', 'appver': '2.0.2'})
+        finally:
+            # restore original headers
+            self.header = old_header
 
     def login_qr_check(self, key):
         path = '/weapi/login/qrcode/client/login'
         params = dict(key=key, type=1)
-        data = self.request("POST", path, params)
+        # retrieve csrf token from cookies to append to query (some endpoints expect it in URL)
+        csrf_token = ''
+        for cookie in self.session.cookies:
+            if cookie.name == '__csrf':
+                csrf_token = cookie.value
+                break
+        # build query path including csrf_token if available
+        query_path = path + ('?csrf_token={}'.format(csrf_token) if csrf_token else '')
+        # ensure sDeviceId exists and build x-login-chain-id
+        sdevice_val = None
+        for c in self.session.cookies:
+            if c.name == 'sDeviceId':
+                sdevice_val = c.value
+                break
+        if not sdevice_val:
+            try:
+                sdevice_val = 'YD-' + uuid.uuid4().hex[:24]
+                self.session.cookies.set_cookie(self.make_cookie('sDeviceId', sdevice_val))
+            except Exception:
+                sdevice_val = None
+        x_login_chain = None
+        try:
+            if sdevice_val:
+                x_login_chain = 'v1_{0}_web_login_{1}'.format(quote_plus(sdevice_val), int(time.time() * 1000))
+        except Exception:
+            x_login_chain = None
+        # Temporarily augment headers to match web client expectations
+        extra_headers = {
+            'x-loginmethod': 'QrCode',
+            'x-os': 'web',
+            'x-login-chain-id': x_login_chain or '',
+            'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'Referer': 'https://music.163.com/',
+            'Origin': 'https://music.163.com',
+            'x-channelsource': 'undefined',
+        }
+        old_header = self.header.copy()
+        try:
+            self.header.update(extra_headers)
+            # use PC-like cookies for QR login check as well
+            data = self.request("POST", query_path, params, custom_cookies={'os': 'pc', 'appver': '2.0.2'})
+        finally:
+            self.header = old_header
+        # Debug log the response to help diagnose failures (will appear in Kodi log)
+        try:
+            xbmc.log('[music163] login_qr_check response: {}'.format(json.dumps(data)), xbmc.LOGDEBUG)
+        except Exception:
+            pass
+        # 803 == login success in current implementations
         if data.get('code', 0) == 803:
-            self.session.cookies.save()
+            try:
+                self.session.cookies.save()
+            except Exception:
+                pass
         return data
 
     def vip_timemachine(self, startTime, endTime, limit=60):

@@ -913,18 +913,44 @@ def qrcode_check():
 
 
 def check_login_status(key):
-    for i in range(10):
+    # Poll for QR login result. Increase retries to allow user more time.
+    dialog = xbmcgui.Dialog()
+    for i in range(20):
         check_result = music.login_qr_check(key)
-        if check_result['code'] == 803:
+        code = check_result.get('code', 0)
+        # Debug/log the returned payload
+        try:
+            xbmc.log('[music163] qrcode poll #{} response: {}'.format(i, check_result), xbmc.LOGDEBUG)
+        except Exception:
+            pass
+        if code == 803:
+            # login success
             account['logined'] = True
-            resp = music.user_level()
-            account['uid'] = resp['data']['userId']
-            dialog = xbmcgui.Dialog()
-            dialog.notification('登录成功', '请重启软件以解锁更多功能',
-                                xbmcgui.NOTIFICATION_INFO, 800, False)
+            try:
+                resp = music.user_level()
+                account['uid'] = resp['data'].get('userId') if resp.get('data') else account.get('uid')
+            except Exception:
+                # fallback: try fetching user detail later when needed
+                account['uid'] = account.get('uid')
+            dialog.notification('登录成功', '请重启软件以解锁更多功能', xbmcgui.NOTIFICATION_INFO, 800, False)
             xbmc.executebuiltin('Action(Back)')
             break
+        elif code == 800:
+            # expired
+            msg = check_result.get('msg', '二维码已失效')
+            dialog.notification('登录失败', msg, xbmcgui.NOTIFICATION_INFO, 800, False)
+            break
+        elif code in (801, 802):
+            # 801: waiting for scan; 802: scanned but not confirmed (common meanings)
+            # show a subtle progress notification on first scan detection
+            if code == 802:
+                dialog.notification('已扫码', '请在手机上确认登录', xbmcgui.NOTIFICATION_INFO, 1000, False)
+        else:
+            # Unknown/other codes: surface message to user and continue polling
+            msg = check_result.get('msg') or check_result.get('message') or str(check_result)
+            xbmc.log('[music163] unexpected qrcode response code: {} msg: {}'.format(code, msg), xbmc.LOGWARNING)
         time.sleep(3)
+    # ensure UI returns to previous view
     xbmc.executebuiltin('Action(Back)')
 
 
